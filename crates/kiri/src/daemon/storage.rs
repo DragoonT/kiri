@@ -696,7 +696,7 @@ pub fn serve_unavailable(stream: UnixStream, missing: &Path) -> io::Result<()> {
     let mut r = BufReader::new(stream);
     let unavailable = chosen::Unavailable(missing.to_owned()).to_string();
     loop {
-        let req = match http::read_request(&mut r, |_, _| false) {
+        let req = match http::read_request_with_timeout(&mut r, http::HEADER_TIMEOUT, |_, _| false) {
             Ok(Some(req)) => req,
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {

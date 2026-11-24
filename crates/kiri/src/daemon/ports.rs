@@ -2106,33 +2106,88 @@ pub const ENGINE_API_PORT: u32 = 1036;
 /// One container connection to the engine's API, served like any other
 /// client's, marked as a container's.
 pub fn serve_engine_api(stream: kiri_vmm::VsockStream, engine: std::sync::Weak<super::engine::Engine>) {
+    let Some(permit) = super::try_acquire_container_conn() else {
+        drop(stream);
+        return;
+    };
     let _ = std::thread::Builder::new().name("kiri-engine-api".into()).spawn(move || {
+        let _permit = permit;
         // Served here rather than through the daemon's socket, so the API
         // knows these requests are a container's (caller.rs).
         let Some(engine) = engine.upgrade() else { return };
-        let Ok((api, ours)) = std::os::unix::net::UnixStream::pair() else { return };
-        let served = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+        let _ = relay_engine_api(&stream.fd, move |ours| {
             let _ = super::api::serve(ours, engine, super::caller::Caller::Container);
         });
-        if served.is_err() {
-            return;
-        }
-        let (Ok(mut api_read), Ok(from_guest), Ok(to_guest)) = (api.try_clone(), stream.fd.try_clone(), stream.fd.try_clone()) else {
-            return;
-        };
-        let mut from_guest = std::fs::File::from(from_guest);
-        let mut to_guest = std::fs::File::from(to_guest);
-        let mut api_write = api;
-        let down = std::thread::spawn(move || {
-            let _ = copy(&mut api_read, &mut to_guest);
-            // SAFETY: half-closing a socket we own.
-            unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_WR) };
-        });
-        let _ = copy(&mut from_guest, &mut api_write);
-        let _ = api_write.shutdown(Shutdown::Write);
-        let _ = down.join();
         drop(stream);
     });
+}
+
+/// Relays one guest engine-API stream to `serve` over a local `UnixStream`
+/// pair. Once `serve` exits (after `HEADER_TIMEOUT`, `Connection: close`, 400,
+/// 403, 413, or EOF) and any buffered response has been written to `guest`,
+/// both directions of `guest` are shut down (`SHUT_RDWR`) so a half-open guest
+/// connection can never leave `from_guest` blocked or pin a container permit.
+fn relay_engine_api(
+    guest: &OwnedFd,
+    serve: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> io::Result<()> {
+    struct ShutdownWriteOnDrop(std::os::unix::net::UnixStream);
+    impl Drop for ShutdownWriteOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.shutdown(Shutdown::Write);
+        }
+    }
+
+    let _ = vsock_stall(guest.as_raw_fd());
+    let (api, ours) = std::os::unix::net::UnixStream::pair()?;
+    let ours_end = ShutdownWriteOnDrop(ours.try_clone()?);
+    let (mut api_read, from_guest, to_guest) = (api.try_clone()?, guest.try_clone()?, guest.try_clone()?);
+    let mut from_guest = std::fs::File::from(from_guest);
+    let mut to_guest = std::fs::File::from(to_guest);
+    let mut api_write = api;
+    let served = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+        let _end = ours_end;
+        serve(ours);
+    })?;
+    let (served_tx, served_rx) = std::sync::mpsc::sync_channel::<JoinHandle<()>>(1);
+    let down = match std::thread::Builder::new().name("kiri-engine-api-down".into()).spawn(move || {
+        let copied = copy(&mut api_read, &mut to_guest);
+        if copied.is_err() {
+            // Guest stopped reading or disconnected: wake `kiri-api` and `from_guest`.
+            let _ = api_read.shutdown(Shutdown::Both);
+            // SAFETY: shutting down both directions on a socket we own.
+            unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
+            if let Ok(served) = served_rx.recv() {
+                let _ = served.join();
+            }
+            return;
+        }
+        // `serve` shut down its write half (clean exit or `http::close`
+        // linger): signal write-EOF to the guest now, wait for `serve` to
+        // finish, then shut down both directions so a half-open guest cannot
+        // pin `from_guest` (and the container connection permit) forever.
+        // SAFETY: shutting down a socket we own.
+        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_WR) };
+        if let Ok(served) = served_rx.recv() {
+            let _ = served.join();
+        }
+        // SAFETY: shutting down both directions wakes `from_guest`.
+        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            // SAFETY: tear down both ends if the downlink thread could not spawn.
+            unsafe { libc::shutdown(guest.as_raw_fd(), libc::SHUT_RDWR) };
+            let _ = api_write.shutdown(Shutdown::Both);
+            let _ = served.join();
+            return Err(e);
+        }
+    };
+    let _ = served_tx.send(served);
+    let _ = copy(&mut from_guest, &mut api_write);
+    let _ = api_write.shutdown(Shutdown::Write);
+    let _ = down.join();
+    Ok(())
 }
 
 /// The TCP ports in a container's `/proc/net/tcp` and `tcp6` lines that are
@@ -2691,5 +2746,144 @@ Wireless LAN adapter Wi-Fi:\r\n\
         assert!(!ips.contains(&"192.0.2.1".parse().unwrap()));
         assert!(!ips.contains(&"fe80::1".parse().unwrap()));
         assert!(!ips.contains(&"203.0.113.99".parse().unwrap()));
+    }
+
+    #[test]
+    fn engine_api_relay_tears_down_half_open_guest_and_releases_permit() {
+        use std::io::{BufReader, Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let cap = super::super::ConnCap::for_test(1);
+
+        // 1. Idle guest that never sends and never closes: when `api::serve`
+        //    exits after HEADER_TIMEOUT, both directions shut down promptly and
+        //    the container permit is released.
+        {
+            let permit = cap.try_acquire_for_test().unwrap();
+            let (mut guest_client, guest_server) = UnixStream::pair().unwrap();
+            guest_client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let guest_fd = OwnedFd::from(guest_server);
+            let t0 = Instant::now();
+            let t = std::thread::spawn(move || {
+                let _permit = permit;
+                super::relay_engine_api(&guest_fd, |ours| {
+                    let mut r = BufReader::new(ours);
+                    let _ = super::super::http::read_request_with_timeout(&mut r, Duration::from_millis(60), |_, _| false);
+                })
+                .unwrap();
+            });
+            // Keep `guest_client` open (half-open) until the relay finishes.
+            let mut reply = Vec::new();
+            guest_client.read_to_end(&mut reply).unwrap();
+            t.join().unwrap();
+            assert!(reply.is_empty());
+            assert!(t0.elapsed() < Duration::from_secs(2), "idle relay hung for {:?}", t0.elapsed());
+            assert_eq!(cap.open(), 0, "container permit must be released after timeout");
+            drop(guest_client);
+        }
+
+        // 2. Guest sends a request that ends the connection (403 / Next::Close)
+        //    and keeps its write side open: guest still receives the full 403
+        //    response, and the relay exits promptly without pinning the permit.
+        {
+            let permit = cap.try_acquire_for_test().unwrap();
+            let (mut guest_client, guest_server) = UnixStream::pair().unwrap();
+            guest_client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let guest_fd = OwnedFd::from(guest_server);
+            let t0 = Instant::now();
+            let t = std::thread::spawn(move || {
+                let _permit = permit;
+                super::relay_engine_api(&guest_fd, |ours| {
+                    let mut w = ours.try_clone().unwrap();
+                    let mut r = BufReader::new(ours);
+                    let req = super::super::http::read_request_with_timeout(&mut r, Duration::from_secs(2), |_, _| false)
+                        .unwrap()
+                        .unwrap();
+                    super::super::http::serving(&req);
+                    super::super::http::error(&mut w, 403, "forbidden").unwrap();
+                })
+                .unwrap();
+            });
+            guest_client.write_all(b"POST /kiri/stop HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+            // Intentionally do NOT shut down guest_client's write half.
+            let mut reply = Vec::new();
+            guest_client.read_to_end(&mut reply).unwrap();
+            t.join().unwrap();
+            let text = String::from_utf8_lossy(&reply);
+            assert!(text.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{text}");
+            assert!(text.contains("forbidden"), "{text}");
+            assert!(t0.elapsed() < Duration::from_secs(2), "403 relay hung for {:?}", t0.elapsed());
+            assert_eq!(cap.open(), 0, "container permit must be released after 403");
+            drop(guest_client);
+        }
+
+        // 3. Guest sends a 413 Too Large request with `http::close` linger while
+        //    keeping its write side open: guest receives the full 413 response
+        //    and the relay finishes after linger instead of hanging forever.
+        {
+            let permit = cap.try_acquire_for_test().unwrap();
+            let (mut guest_client, guest_server) = UnixStream::pair().unwrap();
+            guest_client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let guest_fd = OwnedFd::from(guest_server);
+            let t0 = Instant::now();
+            let t = std::thread::spawn(move || {
+                let _permit = permit;
+                super::relay_engine_api(&guest_fd, |ours| {
+                    let mut w = ours.try_clone().unwrap();
+                    let mut r = BufReader::new(ours);
+                    let req = super::super::http::read_request_with_timeout(&mut r, Duration::from_secs(2), |_, _| false)
+                        .unwrap()
+                        .unwrap();
+                    assert!(req.too_large());
+                    let _ = super::super::http::refuse_too_large(&req, &mut w, &mut r);
+                })
+                .unwrap();
+            });
+            guest_client
+                .write_all(b"POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 100000000\r\n\r\n")
+                .unwrap();
+            // Intentionally do NOT close guest_client's write half.
+            let mut reply = Vec::new();
+            guest_client.read_to_end(&mut reply).unwrap();
+            t.join().unwrap();
+            let text = String::from_utf8_lossy(&reply);
+            assert!(text.starts_with("HTTP/1.1 413 Request Entity Too Large\r\n"), "{text}");
+            assert!(t0.elapsed() < Duration::from_secs(3), "413 relay hung for {:?}", t0.elapsed());
+            assert_eq!(cap.open(), 0, "container permit must be released after 413");
+            drop(guest_client);
+        }
+
+        // 4. Normal guest half-close (`SHUT_WR` after sending request) still
+        //    receives the full HTTP response cleanly.
+        {
+            let permit = cap.try_acquire_for_test().unwrap();
+            let (mut guest_client, guest_server) = UnixStream::pair().unwrap();
+            guest_client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let guest_fd = OwnedFd::from(guest_server);
+            let t = std::thread::spawn(move || {
+                let _permit = permit;
+                super::relay_engine_api(&guest_fd, |ours| {
+                    let mut w = ours.try_clone().unwrap();
+                    let mut r = BufReader::new(ours);
+                    let req = super::super::http::read_request_with_timeout(&mut r, Duration::from_secs(2), |_, _| false)
+                        .unwrap()
+                        .unwrap();
+                    super::super::http::serving(&req);
+                    super::super::http::respond(&mut w, 200, "text/plain", b"OK").unwrap();
+                    assert!(super::super::http::read_request_with_timeout(&mut r, Duration::from_secs(2), |_, _| false).unwrap().is_none());
+                })
+                .unwrap();
+            });
+            guest_client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+            guest_client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = Vec::new();
+            guest_client.read_to_end(&mut reply).unwrap();
+            t.join().unwrap();
+            let text = String::from_utf8_lossy(&reply);
+            assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("\r\n\r\nOK"), "{text}");
+            assert_eq!(cap.open(), 0);
+        }
     }
 }

@@ -25,7 +25,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Res
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     loop {
-        let req = match http::read_request(&mut r, streams_body) {
+        let req = match http::read_request_with_timeout(&mut r, http::HEADER_TIMEOUT, streams_body) {
             Ok(Some(req)) => req,
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {

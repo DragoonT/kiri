@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #207 Hardening: poison-tolerant Share locks, 0600 Share files, non-localhost Share warning, daemon connection cap and header timeout, and `kiri-init` panic hook (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/share.rs`, `crates/kiri/src/daemon/mod.rs`, `crates/kiri/src/daemon/ports.rs`, `crates/kiri/src/daemon/http.rs`, `crates/kiri-init/src/linux/mod.rs`
+
 ### #465 Images: load OCI image-layout archives and verify existing content-addressed blobs in memory (unreleased)
 - Fixes: #465 Load OCI image-layout archives (`index.json` + `blobs/sha256/...`) in `docker load`
 - Caused: none known

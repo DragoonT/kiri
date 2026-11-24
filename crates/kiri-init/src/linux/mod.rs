@@ -38,6 +38,7 @@ use sys::{boottime_ns, check, mount};
 const DATA: &str = "/var/lib/kiri";
 
 pub fn main() {
+    install_panic_hook();
     let init_start_ns = boottime_ns();
     let result = run(init_start_ns);
     if let Err(e) = &result {
@@ -48,6 +49,71 @@ pub fn main() {
         std::process::exit(i32::from(result.is_err()));
     }
     power_off();
+}
+
+/// Stack buffer size for panic reporting: avoids heap allocation in the panic
+/// hook so panics during OOM or inside `eprintln!` still log cleanly.
+const PANIC_BUF_LEN: usize = 512;
+
+/// With `panic = "abort"`, a panic in PID 1 or the host agent would otherwise
+/// abort without leaving a message on the console/stderr. Format into a fixed
+/// stack buffer and write directly to `STDERR_FILENO` via `libc::write` (no
+/// heap allocation and no `std::io::stderr()` RefCell/lock, so a panic during
+/// OOM or inside `eprintln!` argument formatting cannot double-panic).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+        let location = info.location().map(|l| (l.file(), l.line()));
+        let mut buf = [0u8; PANIC_BUF_LEN];
+        let msg = format_panic_message(&mut buf, location, payload);
+        write_stderr_all(msg);
+    }));
+}
+
+fn format_panic_message<'a>(
+    buf: &'a mut [u8],
+    location: Option<(&str, u32)>,
+    payload: Option<&str>,
+) -> &'a [u8] {
+    if buf.is_empty() {
+        return &[];
+    }
+    let what = payload.unwrap_or("a panic payload that is not a string");
+    let mut cur = io::Cursor::new(&mut *buf);
+    let res = match location {
+        Some((file, line)) => write!(cur, "kiri-init: panic at {file}:{line}: {what}\n"),
+        None => write!(cur, "kiri-init: panic at <unknown location>: {what}\n"),
+    };
+    let len = cur.position() as usize;
+    if res.is_err() {
+        let mut end = len.min(buf.len() - 1);
+        // Back up past any UTF-8 continuation bytes so truncation ends on a
+        // character boundary before overwriting the final byte with '\n'.
+        while end > 0 && (buf[end] & 0b1100_0000) == 0b1000_0000 {
+            end -= 1;
+        }
+        buf[end] = b'\n';
+        return &buf[..=end];
+    }
+    &buf[..len]
+}
+
+fn write_stderr_all(mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        // SAFETY: writing a valid stack slice directly to STDERR_FILENO.
+        let n = unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+        } else if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
 }
 
 fn run(init_start_ns: u64) -> io::Result<()> {
@@ -878,5 +944,43 @@ mod cgroup_discovery_tests {
         assert!(super::is_mounted_at(mountinfo, Path::new("/var/lib/kiri")));
         assert!(!super::is_mounted_at(mountinfo, Path::new("/var/lib")));
         assert!(!super::is_mounted_at(mountinfo, Path::new("/media/ssd")));
+    }
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    #[test]
+    fn formats_panic_location_and_payload_into_stack_buffer() {
+        let mut buf = [0u8; super::PANIC_BUF_LEN];
+        assert_eq!(
+            super::format_panic_message(&mut buf, Some(("crates/kiri-init/src/linux/agent.rs", 42)), Some("boom")),
+            b"kiri-init: panic at crates/kiri-init/src/linux/agent.rs:42: boom\n"
+        );
+        assert_eq!(
+            super::format_panic_message(&mut buf, None, Some("oops")),
+            b"kiri-init: panic at <unknown location>: oops\n"
+        );
+        assert_eq!(
+            super::format_panic_message(&mut buf, Some(("mod.rs", 7)), None),
+            b"kiri-init: panic at mod.rs:7: a panic payload that is not a string\n"
+        );
+
+        // Oversized messages truncate cleanly inside the fixed stack buffer
+        // with a trailing newline and valid UTF-8.
+        let long = "x".repeat(super::PANIC_BUF_LEN * 2);
+        let out = super::format_panic_message(&mut buf, Some(("a.rs", 1)), Some(&long));
+        assert_eq!(out.len(), super::PANIC_BUF_LEN);
+        assert!(out.ends_with(b"\n"));
+        assert!(std::str::from_utf8(out).is_ok());
+
+        let mut small = [0u8; 34];
+        // "kiri-init: panic at a.rs:1: " is 28 bytes; "éééé" has 2-byte UTF-8 chars.
+        let out = super::format_panic_message(&mut small, Some(("a.rs", 1)), Some("éééé"));
+        assert!(out.ends_with(b"\n"));
+        let text = std::str::from_utf8(out).expect("truncated output must stay valid UTF-8");
+        assert!(text.starts_with("kiri-init: panic at a.rs:1: "));
+
+        let mut empty = [];
+        assert_eq!(super::format_panic_message(&mut empty, Some(("a.rs", 1)), Some("x")), b"");
     }
 }

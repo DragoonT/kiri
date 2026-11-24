@@ -133,6 +133,33 @@ impl Request {
     }
 }
 
+/// How long an idle or slow connection may sit before the next request head
+/// finishes arriving. Cleared as soon as the request is read so long-running
+/// streams (`logs -f`, `events`, `wait`, `stats`), streamed uploads (`build`,
+/// `load`, `archive`), and hijacked connections (`attach`, `exec`) never time
+/// out.
+pub const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Reads the next request with `timeout` bounding the read of the request head
+/// (and any small buffered body), then clears the socket read timeout before
+/// returning `Ok(Some(_))`.
+///
+/// `SO_RCVTIMEO` applies to the underlying kernel socket on both Linux and
+/// macOS, so clearing it here clears it for cloned handles (`w`,
+/// `forward_stdin`, USB passthrough) as well.
+pub fn read_request_with_timeout(
+    r: &mut BufReader<UnixStream>,
+    timeout: std::time::Duration,
+    stream: impl Fn(&str, &str) -> bool,
+) -> io::Result<Option<Request>> {
+    r.get_ref().set_read_timeout(Some(timeout))?;
+    let res = read_request(r, stream);
+    if matches!(res, Ok(Some(_))) {
+        r.get_ref().set_read_timeout(None)?;
+    }
+    res
+}
+
 /// Reads the next request on a connection. `Ok(None)` is a clean close.
 /// When `stream(method, path)` is true the body stays unread: the handler
 /// reads it through [`Body`].
@@ -1493,5 +1520,113 @@ mod tests {
             let req = read_request(&mut sock(dup.as_bytes()), |_, _| false).unwrap().unwrap();
             assert_eq!(req.body, b"abcd", "{dup:?}");
         }
+    }
+
+    #[test]
+    fn header_timeout_aborts_idle_and_partial_connections() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let timeout = Duration::from_millis(60);
+
+        // 1. Completely idle connection times out instead of blocking forever.
+        let (_client_idle, server_idle) = UnixStream::pair().unwrap();
+        let mut r = BufReader::new(server_idle);
+        let t0 = Instant::now();
+        let err = read_request_with_timeout(&mut r, timeout, |_, _| false).unwrap_err();
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected timeout error, got {err:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(2), "idle read took {:?}", t0.elapsed());
+
+        // 2. Partial header that never finishes also times out.
+        let (mut client_slow, server_slow) = UnixStream::pair().unwrap();
+        client_slow.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n").unwrap();
+        let mut r = BufReader::new(server_slow);
+        let err = read_request_with_timeout(&mut r, timeout, |_, _| false).unwrap_err();
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected timeout error on partial header, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_timeout_clears_before_streaming_and_hijacked_reads() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        let header_timeout = Duration::from_millis(60);
+
+        // 1. Streamed upload (like `POST /build` or `POST /images/load`):
+        // headers arrive quickly, then the body arrives well after `header_timeout`.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer_handle = server.try_clone().unwrap();
+        let mut r = BufReader::new(server);
+        let peer = std::thread::spawn(move || {
+            client.write_all(b"POST /build HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            // Sleep well past the 60 ms header timeout before sending the streamed body.
+            std::thread::sleep(Duration::from_millis(160));
+            client.write_all(b"5\r\nhello\r\n0\r\n\r\n").unwrap();
+            client
+        });
+
+        let req = read_request_with_timeout(&mut r, header_timeout, |m, p| m == "POST" && p == "/build")
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.path, "/build");
+        // Clearing SO_RCVTIMEO clears it on the underlying Unix socket for both `r` and clones.
+        assert_eq!(r.get_ref().read_timeout().unwrap(), None, "reader timeout must be cleared");
+        assert_eq!(writer_handle.read_timeout().unwrap(), None, "cloned handle must also have no read timeout");
+
+        let mut body = Body::new(&req, &mut r);
+        let mut payload = String::new();
+        body.read_to_string(&mut payload).unwrap();
+        assert_eq!(payload, "hello");
+        let _client = peer.join().unwrap();
+
+        // 2. Hijacked connection (like `attach` / `exec` + `forward_stdin`):
+        // a cloned fd reads stdin well after `header_timeout` without timing out.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut r = BufReader::new(server);
+        let peer = std::thread::spawn(move || {
+            client
+                .write_all(b"POST /containers/x/attach?stdin=1 HTTP/1.1\r\nHost: d\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(160));
+            client.write_all(b"interactive-input\n").unwrap();
+            client
+        });
+
+        let req = read_request_with_timeout(&mut r, header_timeout, |_, _| false).unwrap().unwrap();
+        assert_eq!(req.path, "/containers/x/attach");
+        let mut stdin = r.get_ref().try_clone().unwrap();
+        assert_eq!(stdin.read_timeout().unwrap(), None, "hijacked clone must have no read timeout");
+        let mut line = [0u8; 18];
+        stdin.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"interactive-input\n");
+        let _client = peer.join().unwrap();
+
+        // 3. Keep-alive connection: after a completed request, the next idle
+        // wait re-arms `header_timeout` and times out cleanly.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut r = BufReader::new(server);
+        client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+        let req = read_request_with_timeout(&mut r, header_timeout, |_, _| false).unwrap().unwrap();
+        assert_eq!(req.path, "/_ping");
+        assert_eq!(r.get_ref().read_timeout().unwrap(), None);
+        // Second read on the idle keep-alive socket must re-arm and time out.
+        let err = read_request_with_timeout(&mut r, header_timeout, |_, _| false).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "expected idle keep-alive timeout, got {err:?}");
+        drop(client);
+
+        // 4. Clearing timeout also succeeds when the peer half-closes right after sending headers.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut r = BufReader::new(server);
+        let req = read_request_with_timeout(&mut r, header_timeout, |_, _| false).unwrap().unwrap();
+        assert_eq!(req.path, "/_ping");
+        assert_eq!(r.get_ref().read_timeout().unwrap(), None);
     }
 }

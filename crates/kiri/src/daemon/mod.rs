@@ -407,9 +407,11 @@ fn accept(
     #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
     who: caller::Caller,
 ) {
+    let cap = open_conns_for(&who);
     let engine = engine.clone();
-    serve_each(
+    serve_each_with(
         listener,
+        cap,
         #[cfg(target_os = "linux")]
         gate,
         std::sync::Arc::new(move |conn| {
@@ -418,18 +420,146 @@ fn accept(
     );
 }
 
-/// Hands each connection `listener` takes to `serve`, on a thread of its own.
+/// Maximum concurrent open client connections from host or WSL callers, kept
+/// separate from [`MAX_CONTAINER_OPEN_CONNS`] so a container mounting
+/// `/var/run/docker.sock` can never starve host UI `/events`, `docker ps`,
+/// `exec`, or `kiri stop`.
+const MAX_HOST_OPEN_CONNS: usize = 512;
+
+/// Maximum concurrent open client connections from containers mounting the
+/// engine socket (`docker.container.sock` on Linux and the guest vsock relay
+/// in `ports::serve_engine_api` on macOS).
+const MAX_CONTAINER_OPEN_CONNS: usize = 128;
+
+/// Shared cap on concurrent client connections. Each accepted connection holds
+/// a [`ConnPermit`] until its handler exits (or until dropped if thread
+/// creation fails), so slots are never leaked.
+pub(super) struct ConnCap {
+    open: std::sync::atomic::AtomicUsize,
+    limit: usize,
+    pool: &'static str,
+    last_warn: std::sync::Mutex<Option<Instant>>,
+}
+
+pub(super) struct ConnPermit(std::sync::Arc<ConnCap>);
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl ConnCap {
+    fn new(pool: &'static str, limit: usize) -> Self {
+        ConnCap {
+            open: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+            pool,
+            last_warn: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn try_acquire(self: &std::sync::Arc<Self>) -> Option<ConnPermit> {
+        self.open
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| (n < self.limit).then_some(n + 1),
+            )
+            .ok()
+            .map(|_| ConnPermit(self.clone()))
+    }
+
+    fn warn_full(&self) {
+        let mut last = self.last_warn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            *last = Some(Instant::now());
+            diag::warn!("too many open connections; the new one was not served", pool = self.pool, limit = self.limit);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn open(&self) -> usize {
+        self.open.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(limit: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new("test", limit))
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_acquire_for_test(self: &std::sync::Arc<Self>) -> Option<ConnPermit> {
+        self.try_acquire()
+    }
+}
+
+fn host_open_conns() -> &'static std::sync::Arc<ConnCap> {
+    static HOST_OPEN_CONNS: std::sync::OnceLock<std::sync::Arc<ConnCap>> = std::sync::OnceLock::new();
+    HOST_OPEN_CONNS.get_or_init(|| std::sync::Arc::new(ConnCap::new("host", MAX_HOST_OPEN_CONNS)))
+}
+
+fn container_open_conns() -> &'static std::sync::Arc<ConnCap> {
+    static CONTAINER_OPEN_CONNS: std::sync::OnceLock<std::sync::Arc<ConnCap>> = std::sync::OnceLock::new();
+    CONTAINER_OPEN_CONNS.get_or_init(|| std::sync::Arc::new(ConnCap::new("container", MAX_CONTAINER_OPEN_CONNS)))
+}
+
+fn open_conns_for(who: &caller::Caller) -> &'static std::sync::Arc<ConnCap> {
+    match who {
+        caller::Caller::Container => container_open_conns(),
+        caller::Caller::Host | caller::Caller::Wsl(_) => host_open_conns(),
+    }
+}
+
+fn try_acquire_from(cap: &std::sync::Arc<ConnCap>) -> Option<ConnPermit> {
+    let permit = cap.try_acquire();
+    if permit.is_none() {
+        cap.warn_full();
+    }
+    permit
+}
+
+pub(super) fn try_acquire_host_conn() -> Option<ConnPermit> {
+    try_acquire_from(host_open_conns())
+}
+
+pub(super) fn try_acquire_container_conn() -> Option<ConnPermit> {
+    try_acquire_from(container_open_conns())
+}
+
+/// Hands each host connection `listener` takes to `serve`, on a thread of its own.
 fn serve_each(
     listener: &UnixListener,
     #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
     serve: std::sync::Arc<dyn Fn(UnixStream) + Send + Sync>,
 ) {
+    serve_each_with(
+        listener,
+        host_open_conns(),
+        #[cfg(target_os = "linux")]
+        gate,
+        serve,
+    );
+}
+
+fn serve_each_with(
+    listener: &UnixListener,
+    cap: &std::sync::Arc<ConnCap>,
+    #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
+    serve: std::sync::Arc<dyn Fn(UnixStream) + Send + Sync>,
+) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
+        let Some(permit) = cap.try_acquire() else {
+            cap.warn_full();
+            drop(conn);
+            continue;
+        };
         let serve = serve.clone();
         #[cfg(target_os = "linux")]
         let gate = gate.clone();
         let spawned = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+            let _permit = permit;
             // Checked here, not in the accept loop: a slow user lookup holds up
             // this connection only.
             #[cfg(target_os = "linux")]
@@ -787,11 +917,18 @@ impl WslSockets {
                     if stop_loop.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
+                    let Some(permit) = try_acquire_host_conn() else {
+                        drop(conn);
+                        continue;
+                    };
                     let serve = serve.clone();
                     let distro_name = distro_name.clone();
-                    let _ = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+                    if let Err(e) = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+                        let _permit = permit;
                         serve(conn, distro_name);
-                    });
+                    }) {
+                        diag::error!("cannot start a connection thread", error = e);
+                    }
                 }
             })?;
             active.insert(
@@ -1127,6 +1264,129 @@ mod tests {
         cleanup_docker_sock_symlink(&run_link, &target);
         assert_eq!(std::fs::read_link(&run_link).unwrap(), other);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_cap_enforces_limit_and_releases_on_drop() {
+        let cap = std::sync::Arc::new(ConnCap::new("test", 2));
+        let p1 = cap.try_acquire().expect("first slot");
+        let p2 = cap.try_acquire().expect("second slot");
+        assert_eq!(cap.open(), 2);
+        assert!(cap.try_acquire().is_none(), "third slot must be rejected at cap");
+        assert_eq!(cap.open(), 2, "rejected acquire must never exceed limit");
+
+        drop(p1);
+        assert_eq!(cap.open(), 1);
+        let p3 = cap.try_acquire().expect("slot freed after drop");
+        assert_eq!(cap.open(), 2);
+        assert!(cap.try_acquire().is_none());
+
+        drop(p2);
+        drop(p3);
+        assert_eq!(cap.open(), 0);
+    }
+
+    #[test]
+    fn host_and_container_connection_caps_are_isolated() {
+        // Host and WSL callers share the host pool; containers use a separate smaller pool.
+        assert!(std::sync::Arc::ptr_eq(open_conns_for(&caller::Caller::Host), host_open_conns()));
+        assert!(std::sync::Arc::ptr_eq(open_conns_for(&caller::Caller::Wsl("Ubuntu".into())), host_open_conns()));
+        assert!(std::sync::Arc::ptr_eq(open_conns_for(&caller::Caller::Container), container_open_conns()));
+        assert!(!std::sync::Arc::ptr_eq(host_open_conns(), container_open_conns()));
+        assert_eq!(host_open_conns().limit, MAX_HOST_OPEN_CONNS);
+        assert_eq!(container_open_conns().limit, MAX_CONTAINER_OPEN_CONNS);
+
+        // Exhausting every container slot must never starve host or WSL connections.
+        let mut container_permits = Vec::with_capacity(MAX_CONTAINER_OPEN_CONNS);
+        while let Some(p) = try_acquire_container_conn() {
+            container_permits.push(p);
+        }
+        assert_eq!(container_open_conns().open(), MAX_CONTAINER_OPEN_CONNS);
+        assert!(try_acquire_container_conn().is_none(), "container pool must reject once full");
+
+        let host_permit = try_acquire_host_conn().expect("host pool must stay available when container pool is full");
+        drop(host_permit);
+        drop(container_permits);
+        assert_eq!(container_open_conns().open(), 0);
+    }
+
+    #[test]
+    fn serve_each_enforces_connection_cap_and_reclaims_slots() {
+        let dir = std::env::temp_dir().join(format!("kiri-conn-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("docker.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let cap = std::sync::Arc::new(ConnCap::new("test", 2));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let cap_srv = cap.clone();
+        std::thread::spawn(move || {
+            serve_each_with(
+                &listener,
+                &cap_srv,
+                #[cfg(target_os = "linux")]
+                &None,
+                std::sync::Arc::new(move |mut conn| {
+                    let _ = entered_tx.send(());
+                    // Wait until the client writes a byte or closes, then reply "ok".
+                    let mut b = [0u8; 1];
+                    if conn.read(&mut b).is_ok_and(|n| n > 0) {
+                        let _ = conn.write_all(b"ok");
+                    }
+                }),
+            );
+        });
+
+        let mut c1 = UnixStream::connect(&sock).unwrap();
+        let mut c2 = UnixStream::connect(&sock).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(cap.open(), 2);
+
+        // Third concurrent connection is dropped immediately without entering handler.
+        let mut c3 = UnixStream::connect(&sock).unwrap();
+        c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 8];
+        match c3.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => {}
+            other => panic!("expected immediate close at cap, got {other:?}"),
+        }
+        assert!(entered_rx.try_recv().is_err(), "capped connection must not invoke handler");
+        assert_eq!(cap.open(), 2);
+
+        // Finishing c1 releases its slot so a new connection c4 is served.
+        c1.write_all(b"x").unwrap();
+        let mut reply = [0u8; 2];
+        c1.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
+        drop(c1);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cap.open() >= 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(cap.open(), 1, "closing first connection must release its slot");
+
+        let mut c4 = UnixStream::connect(&sock).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c4.write_all(b"y").unwrap();
+        c4.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
+        drop(c4);
+
+        c2.write_all(b"z").unwrap();
+        c2.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
+        drop(c2);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cap.open() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(cap.open(), 0, "all connection slots must be released");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
